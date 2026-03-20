@@ -13,8 +13,12 @@ MAX_SIZE = 200_000
 DRY_RUN = False
 
 session = requests.Session()
+session.headers.update({
+    "User-Agent": "RefDuplicateRemover/1.0"
+})
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+
 
 def get_login_token():
     r = session.get(API_URL, params={
@@ -32,17 +36,12 @@ def verify_login(expected_username):
         "meta": "userinfo",
         "format": "json"
     })
-
     data = r.json()
-
     if "query" not in data or "userinfo" not in data["query"]:
         return False
-
     userinfo = data["query"]["userinfo"]
-
     if userinfo.get("id", 0) == 0:
         return False
-
     actual_user = userinfo.get("name", "")
     return actual_user.lower() == expected_username.lower()
 
@@ -50,12 +49,10 @@ def verify_login(expected_username):
 def login():
     username = os.getenv("WIKI_USERNAME")
     password = os.getenv("WIKI_PASSWORD")
-
     if not username or not password:
         raise Exception("Missing WIKI_USERNAME or WIKI_PASSWORD")
 
     token = get_login_token()
-
     r = session.post(API_URL, data={
         "action": "login",
         "lgname": username,
@@ -63,15 +60,13 @@ def login():
         "lgtoken": token,
         "format": "json"
     })
-
     result = r.json()
-
     if result.get("login", {}).get("result") != "Success":
         raise Exception(f"Login failed: {result}")
 
+    # Verify login
     if not verify_login(username):
-        raise Exception("Login appeared successful but verification failed (not actually logged in)")
-
+        raise Exception("Login verification failed; not actually logged in")
     logging.info(f"Logged in as {username}")
 
 
@@ -93,20 +88,16 @@ def get_page(title):
         "format": "json",
         "maxlag": 5
     })
-
     pages = r.json()["query"]["pages"]
     page = next(iter(pages.values()))
-
     if "missing" in page:
         return None, None
-
     rev = page["revisions"][0]
     return rev["slots"]["main"]["*"], rev["revid"]
 
 
 def edit_page(title, text, summary):
     token = get_csrf_token()
-
     r = session.post(API_URL, data={
         "action": "edit",
         "title": title,
@@ -116,12 +107,9 @@ def edit_page(title, text, summary):
         "format": "json",
         "maxlag": 5
     })
-
     result = r.json()
-
     if "error" in result:
         raise Exception(result["error"])
-
     return result["edit"]["newrevid"]
 
 
@@ -140,25 +128,24 @@ def is_inside_template(node):
     return False
 
 
-def get_pages_from_list():
-    text, _ = get_page(LIST_PAGE)
-    if not text:
-        return [], ""
-
-    links = re.findall(r"\[\[(.*?)\]\]", text)
-
-    pages = []
-    for link in links:
-        if f"<s>[[{link}]]</s>" not in text:
-            pages.append(link)
-
-    return pages[:MAX_PAGES], text
+def parse_worklist(text):
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("*"):
+            continue
+        content = line[1:].strip()
+        m = re.match(r"\[\[(.*?)\]\]", content)
+        if m:
+            items.append({"title": m.group(1)})
+        else:
+            items.append({"wikitext": content, "label": content})
+    return items[:MAX_PAGES]
 
 
 def fix_duplicate_refs(text):
     wikicode = mwparserfromhell.parse(text)
     refs = wikicode.filter_tags(matches=lambda n: n.tag == "ref")
-
     seen = {}
     count = 1
     changes = []
@@ -166,99 +153,92 @@ def fix_duplicate_refs(text):
     for ref in refs:
         if ref.has("name"):
             continue
-
         if is_inside_template(ref):
             continue
-
         content = str(ref.contents).strip()
         norm = normalize_ref(content)
-
         if norm in seen:
             name = seen[norm]
             ref.attributes.append(("name", name))
             ref.contents = None
             changes.append((content, f'<ref name="{name}"/>'))
-
         else:
             name = f"auto{count}"
             seen[norm] = name
             ref.attributes.append(("name", name))
             changes.append((content, f'<ref name="{name}">{content}</ref>'))
             count += 1
-
     return str(wikicode), changes
 
 
-def build_diff_links(old_id, new_id):
-    short = f"https://simple.wikipedia.org/?diff={new_id}"
-    full = f"https://simple.wikipedia.org/w/index.php?diff={new_id}&oldid={old_id}"
-    return short, full
+def build_diff_link(new_rev):
+    return f"https://simple.wikipedia.org/?diff={new_rev}"
 
 
 def update_list_page(original_text, results):
     text = original_text
-
-    for article, summary in results:
-        pattern = re.escape(f"[[{article}]]")
-        replacement = f"<s>[[{article}]]</s> – {summary}"
+    for item in results:
+        article, summary = item["label"], item["summary"]
+        pattern = re.escape(f"* {article}")
+        replacement = f"<s>* {article}</s> – {summary}"
         text = re.sub(pattern, replacement, text, count=1)
-
     if DRY_RUN:
         print("\n--- LIST UPDATE ---\n")
         print(text[:1000])
         return
+    edit_page(LIST_PAGE, text, "Updating processed articles (bot)")
 
-    edit_page(LIST_PAGE, text, "Bot: Updating processed articles")
+def process_item(item):
+    if "title" in item:
+        text, old_rev = get_page(item["title"])
+        label = item["title"]
+    else:
+        text = item["wikitext"]
+        old_rev = None
+        label = item.get("label", "Unnamed block")
+
+    if not text or len(text) > MAX_SIZE:
+        return None
+
+    new_text, changes = fix_duplicate_refs(text)
+    if new_text == text or not changes:
+        return None
+
+    if DRY_RUN:
+        print(f"[DRY RUN] Would edit {label}")
+        return {"label": label, "new_text": new_text, "changes": changes, "new_rev": None}
+
+    if "title" in item:
+        new_rev = edit_page(item["title"], new_text,
+                            "Bot: Convert duplicate <ref> tags to named references (bot)")
+        short_link = build_diff_link(new_rev)
+    else:
+        new_rev = None
+        short_link = "RAW_WIKITEXT"  # no diff for raw blocks
+
+    original, fixed = changes[0]
+    summary_text = f"replaced <code><ref>{original}</ref></code> with <code>{fixed}</code>; {short_link}"
+
+    return {"label": label, "summary": summary_text}
 
 
 def main():
     login()
-
-    pages, list_text = get_pages_from_list()
+    worklist_text, _ = get_page(LIST_PAGE)
+    items = parse_worklist(worklist_text)
     results = []
 
-    for title in pages:
+    for item in items:
         try:
-            text, old_rev = get_page(title)
-
-            if not text or len(text) > MAX_SIZE:
-                continue
-
-            new_text, changes = fix_duplicate_refs(text)
-
-            if new_text == text or not changes:
-                continue
-
-            if DRY_RUN:
-                print(f"[DRY RUN] Would edit {title}")
-                continue
-
-            new_rev = edit_page(
-                title,
-                new_text,
-                "Bot: Convert duplicate <ref> tags to named references"
-            )
-
-            short, full = build_diff_links(old_rev, new_rev)
-
-            original, fixed = changes[0]
-
-            summary = (
-                f"replaced <code><ref>{original}</ref></code> "
-                f"with <code>{fixed}</code>; "
-                f"[{short} short] | [{full} full]"
-            )
-
-            results.append((title, summary))
-            logging.info(f"Edited {title}")
-
-            time.sleep(5)  # delay
-
+            result = process_item(item)
+            if result:
+                results.append(result)
+            time.sleep(5)  # polite delay
         except Exception as e:
-            logging.error(f"Error on {title}: {e}")
+            logging.error(f"Error on item {item}: {e}")
 
     if results:
-        update_list_page(list_text, results)
+        update_list_page(worklist_text, results)
 
 
 if __name__ == "__main__":
