@@ -37,6 +37,10 @@ def verify_login(expected_username):
         "format": "json"
     })
     data = r.json()
+    
+    # Debug
+    logging.info(f"DEBUG: userinfo response: {data.get('query', {}).get('userinfo', {})}")
+    
     if "query" not in data or "userinfo" not in data["query"]:
         return False
     userinfo = data["query"]["userinfo"]
@@ -61,12 +65,16 @@ def login():
         "format": "json"
     })
     result = r.json()
+    
+    logging.info(f"DEBUG: login response: {result}")
+
     if result.get("login", {}).get("result") != "Success":
         raise Exception(f"Login failed: {result}")
 
     # Verify login
     if not verify_login(username):
         raise Exception("Login verification failed; not actually logged in")
+    
     logging.info(f"Logged in as {username}")
 
 
@@ -172,7 +180,7 @@ def fix_duplicate_refs(text):
 
 
 def build_diff_link(new_rev):
-    return f"https://simple.wikipedia.org/?diff={new_rev}"
+    return f"https://test.wikipedia.org/?diff={new_rev}"
 
 
 def update_list_page(original_text, results):
@@ -187,6 +195,7 @@ def update_list_page(original_text, results):
         print(text[:1000])
         return
     edit_page(LIST_PAGE, text, "Updating processed articles (bot)")
+
 
 def process_item(item):
     if "title" in item:
