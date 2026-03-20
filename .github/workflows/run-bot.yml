@@ -1,4 +1,4 @@
-name: SimpleWiki Bot (API)
+name: Ref Duplicate Remover
 
 on:
   workflow_dispatch:
