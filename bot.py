@@ -13,7 +13,7 @@ DRY_RUN = False
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "RefDuplicateRemover/1.0"
+    "User-Agent": "RefDuplicateRemover/2.0"
 })
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -75,7 +75,7 @@ def get_page(title):
     r = session.get(API_URL, params={
         "action": "query",
         "prop": "revisions",
-        "rvprop": "content|ids",
+        "rvprop": "ids|content",
         "rvslots": "main",
         "titles": title,
         "format": "json",
@@ -87,114 +87,98 @@ def get_page(title):
     page = next(iter(pages.values()), None)
 
     if not page or "missing" in page:
+        logging.warning(f"Page missing: {title}")
         return None, None
 
-    revisions = page.get("revisions")
-    if not revisions:
-        return None, None
-
-    rev = revisions[0]
+    rev = page.get("revisions", [{}])[0]
 
     if "slots" in rev:
-        text = rev["slots"]["main"].get("content", "")
+        text = rev["slots"]["main"].get("*", "")
     else:
         text = rev.get("*", "")
+
+    if not text:
+        logging.warning(f"No content retrieved for {title}")
 
     return text, rev.get("revid")
 
 
-def edit_page(title, text, summary):
+def edit_page(title, text, summary, base_revid):
     token = get_csrf_token()
 
-    r = session.post(API_URL, data={
-        "action": "edit",
-        "title": title,
-        "text": text,
-        "summary": summary,
-        "token": token,
-        "format": "json",
-        "maxlag": 5
-    })
+    for attempt in range(3):
+        r = session.post(API_URL, data={
+            "action": "edit",
+            "title": title,
+            "text": text,
+            "summary": summary,
+            "token": token,
+            "format": "json",
+            "baserevid": base_revid,
+            "maxlag": 5
+        })
 
-    result = r.json()
-    if "error" in result:
-        raise Exception(result["error"])
+        result = r.json()
 
-    return result["edit"]["newrevid"]
+        if "error" in result:
+            if result["error"].get("code") == "maxlag":
+                logging.warning("Maxlag hit, retrying...")
+                time.sleep(5)
+                continue
+            raise Exception(result["error"])
+
+        return result["edit"]["newrevid"]
+
+    raise Exception("Edit failed after retries")
 
 
 # ---------------- REF PROCESSING ----------------
 
 def normalize_ref(content):
-    return re.sub(r"\s+", " ", content.strip())
+    return re.sub(r"\s+", " ", content.strip()).lower()
 
 
-def is_inside_template(node):
-    parent = node
-    while parent:
-        parent = getattr(parent, "parent", None)
-        if parent and parent.__class__.__name__ == "Template":
-            return True
-    return False
-
-
-def generate_ref_name(content, fallback_count):
-    m = re.search(r"\|\s*(website|work|publisher)\s*=\s*([^|}]+)", content, re.I)
-    if m:
-        name = re.sub(r"[^a-z0-9]+", "-", m.group(2).lower())
-        return name.strip("-")
-
-    m = re.search(r"\|\s*title\s*=\s*([^|}]+)", content, re.I)
-    if m:
-        name = re.sub(r"[^a-z0-9]+", "-", m.group(1).lower())
-        return name.strip("-")[:30]
-
-    return f"auto{fallback_count}"
+def extract_url(content):
+    m = re.search(r"\|\s*url\s*=\s*([^|}]+)", content, re.I)
+    return m.group(1).strip() if m else None
 
 
 def fix_duplicate_refs(text):
+    logging.info("Running duplicate ref fixer")
+
     wikicode = mwparserfromhell.parse(text)
-    refs = wikicode.filter_tags(matches=lambda n: n.tag == "ref")
+    refs = [tag for tag in wikicode.filter_tags() if str(tag.tag).lower() == "ref"]
+
+    logging.info(f"Ref tags found: {len(refs)}")
 
     seen = {}
     count = 1
     changes = []
 
     for ref in refs:
-        if is_inside_template(ref):
-            continue
-
         content = str(ref.contents).strip() if ref.contents else ""
-        norm = normalize_ref(content)
-
-        # Learn from already named refs
-        if ref.has("name"):
-            name = str(ref.get("name").value).strip()
-            if content:
-                seen[norm] = name
-            continue
 
         if not content:
             continue
 
-        if norm in seen:
-            name = seen[norm]
-            ref.attributes["name"] = name
-            ref.contents = ""
+        url = extract_url(content)
+        key = url if url else normalize_ref(content)
+
+        if key in seen:
+            name = seen[key]
+
+            ref.clear()
+            ref.add("name", name)
             ref.self_closing = True
-            changes.append((content, f'<ref name="{name}"/>'))
+
+            changes.append(("dup", name))
         else:
-            base = generate_ref_name(content, count)
-            name = base
-            i = 2
+            name = f"auto{count}"
+            seen[key] = name
 
-            while name in seen.values():
-                name = f"{base}-{i}"
-                i += 1
+            if not ref.has("name"):
+                ref.add("name", name)
 
-            seen[norm] = name
-            ref.attributes["name"] = name
-            changes.append((content, f'<ref name="{name}">{content}</ref>'))
             count += 1
 
     return str(wikicode), changes
@@ -208,81 +192,67 @@ def parse_worklist(text):
     for line in text.splitlines():
         line = line.strip()
 
-        if not line.startswith("*"):
+        if not line.startswith(("*", "#")):
             continue
 
-        content = line.lstrip("*").strip()
+        content = line.lstrip("*# ").strip()
 
-        m = re.match(r"\[\[\s*([^|\]]+)(?:\|[^\]]*)?\s*\]\]", content)
+        m = re.match(r"\[\[\s*([^|\]]+)", content)
         if m:
-            title = m.group(1).strip()
-            items.append({"title": title, "label": content})
-            continue
+            items.append({"title": m.group(1).strip(), "label": content})
 
-        if content and not any(x in content for x in ["{", "<", "[[File:", "[[Image:"]):
-            items.append({"title": content, "label": content})
-            continue
-
-        items.append({"wikitext": content, "label": content})
-
+    logging.info(f"Parsed {len(items)} worklist items")
     return items[:MAX_PAGES]
 
 
 # ---------------- PROCESS ----------------
 
-def build_diff_link(new_rev):
-    return f"https://test.wikipedia.org/?diff={new_rev}"
-
-
 def process_item(item):
-    if "title" in item:
-        text, _ = get_page(item["title"])
-        label = item["title"]
-    else:
-        text = item["wikitext"]
-        label = item.get("label", "Unnamed")
+    label = item["title"]
 
-    if not text or len(text) > MAX_SIZE:
+    logging.info(f"Processing: {label}")
+
+    text, revid = get_page(label)
+
+    if not text:
+        return None
+
+    if len(text) > MAX_SIZE:
+        logging.warning(f"Skipping {label}: too large")
         return None
 
     new_text, changes = fix_duplicate_refs(text)
 
-    if new_text == text or not changes:
+    if not changes:
+        logging.info(f"No duplicate refs in {label}")
         return None
 
     if DRY_RUN:
-        print(f"[DRY RUN] {label}")
+        logging.info(f"[DRY RUN] Would edit {label}")
         return {"label": label}
 
-    if "title" in item:
-        new_rev = edit_page(
-            item["title"],
-            new_text,
-            "Bot: Fix duplicate references"
-        )
-        link = build_diff_link(new_rev)
-    else:
-        link = "RAW"
+    new_rev = edit_page(
+        label,
+        new_text,
+        "Bot: Fix duplicate references",
+        revid
+    )
 
-    original, fixed = changes[0]
-    summary = f"Replaced <ref>{original}</ref> with {fixed}; {link}"
-
-    return {"label": label, "summary": summary}
+    return {"label": label, "rev": new_rev}
 
 
 def update_list_page(original_text, results):
     text = original_text
 
     for item in results:
-        pattern = re.escape(f"* {item['label']}")
-        replacement = f"<s>* {item['label']}</s> – {item['summary']}"
+        pattern = re.escape(f"* [[{item['label']}]]")
+        replacement = f"<s>* [[{item['label']}]]</s> – done"
         text = re.sub(pattern, replacement, text, count=1)
 
     if DRY_RUN:
-        print(text[:1000])
         return
 
-    edit_page(LIST_PAGE, text, "Updating processed articles (bot)")
+    edit_page(LIST_PAGE, text, "Updating processed articles (bot)", None)
 
 
 # ---------------- MAIN ----------------
@@ -291,6 +261,13 @@ def main():
     login()
 
     worklist_text, _ = get_page(LIST_PAGE)
+
+    if not worklist_text:
+        logging.error("Worklist page empty!")
+        return
+
+    logging.info(f"Worklist preview:\n{worklist_text[:300]}")
+
     items = parse_worklist(worklist_text)
 
     results = []
@@ -300,9 +277,11 @@ def main():
             result = process_item(item)
             if result:
                 results.append(result)
-            time.sleep(5)
+            time.sleep(3)
         except Exception as e:
-            logging.error(f"Error on item {item}: {e}")
+            logging.error(f"Error on {item}: {e}")
+
+    logging.info(f"Total edits: {len(results)}")
 
     if results:
         update_list_page(worklist_text, results)
