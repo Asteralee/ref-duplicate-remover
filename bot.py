@@ -13,7 +13,7 @@ DRY_RUN = False
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "RefDuplicateRemover/2.0"
+    "User-Agent": "RefDuplicateRemover/3.0"
 })
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -135,12 +135,58 @@ def edit_page(title, text, summary, base_revid):
 # ---------------- REF PROCESSING ----------------
 
 def normalize_ref(content):
-    return re.sub(r"\s+", " ", content.strip()).lower()
+    content = re.sub(r"\s+", " ", content.strip())
+    content = re.sub(r"\|\s+", "|", content)
+    content = re.sub(r"\s+\|", "|", content)
+    return content.lower()
+
+
+def extract_field(content, field):
+    m = re.search(rf"\|\s*{field}\s*=\s*([^|}}]+)", content, re.I)
+    return m.group(1).strip() if m else None
 
 
 def extract_url(content):
-    m = re.search(r"\|\s*url\s*=\s*([^|}]+)", content, re.I)
-    return m.group(1).strip() if m else None
+    return extract_field(content, "url")
+
+
+def normalize_url(url):
+    if not url:
+        return None
+
+    url = url.strip().lower()
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    url = re.sub(r"\?.*$", "", url)
+    url = url.rstrip("/")
+
+    return url
+
+
+def generate_smart_name(content, fallback_count):
+    for field in ["website", "publisher", "work"]:
+        val = extract_field(content, field)
+        if val:
+            val = re.sub(r"https?://(www\.)?", "", val.lower())
+            val = val.split("/")[0]
+            name = re.sub(r"[^a-z0-9]+", "-", val)
+            return name.strip("-")[:30]
+
+    title = extract_field(content, "title")
+    if title:
+        name = re.sub(r"[^a-z0-9]+", "-", title.lower())
+        return name.strip("-")[:30]
+
+    return f"ref{fallback_count}"
+
+
+def is_inside_template(node):
+    parent = getattr(node, "parent", None)
+    while parent:
+        if parent.__class__.__name__ == "Template":
+            return True
+        parent = getattr(parent, "parent", None)
+    return False
 
 
 def fix_duplicate_refs(text):
@@ -151,8 +197,14 @@ def fix_duplicate_refs(text):
 
     logging.info(f"Ref tags found: {len(refs)}")
 
+    existing_names = set()
+    for ref in refs:
+        if ref.has("name"):
+            existing_names.add(str(ref.get("name").value).strip())
+
     seen = {}
-    count = 1
+    name_used = set(existing_names)
+    fallback_count = 1
     changes = []
 
     for ref in refs:
@@ -161,25 +213,42 @@ def fix_duplicate_refs(text):
         if not content:
             continue
 
+        if is_inside_template(ref) or "{{" in content:
+            continue
+
         url = extract_url(content)
-        key = url if url else normalize_ref(content)
+        norm_url = normalize_url(url)
+        key = norm_url if norm_url else normalize_ref(content)
 
-        if key in seen:
-            name = seen[key]
+        existing_name = str(ref.get("name").value).strip() if ref.has("name") else None
 
-            ref.clear()
-            ref.add("name", name)
-            ref.self_closing = True
+        if key not in seen:
+            if existing_name:
+                name = existing_name
+            else:
+                name = generate_smart_name(content, fallback_count)
 
-            changes.append(("dup", name))
-        else:
-            name = f"auto{count}"
+            base = name
+            i = 2
+            while name in name_used:
+                name = f"{base}-{i}"
+                i += 1
+
             seen[key] = name
+            name_used.add(name)
 
             if not ref.has("name"):
                 ref.add("name", name)
 
-            count += 1
+            fallback_count += 1
+
+        else:
+            name = seen[key]
+            new_tag = f'<ref name="{name}"/>'
+            wikicode.replace(ref, new_tag)
+            changes.append(name)
+
+    logging.info(f"Duplicate refs fixed: {len(changes)}")
 
     return str(wikicode), changes
 
@@ -209,7 +278,6 @@ def parse_worklist(text):
 
 def process_item(item):
     label = item["title"]
-
     logging.info(f"Processing: {label}")
 
     text, revid = get_page(label)
