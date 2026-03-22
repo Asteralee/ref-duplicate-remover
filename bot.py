@@ -19,6 +19,8 @@ session.headers.update({
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 
+# ---------------- LOGIN ----------------
+
 def get_login_token():
     r = session.get(API_URL, params={
         "action": "query", "meta": "tokens", "type": "login", "format": "json"
@@ -30,20 +32,19 @@ def verify_login(expected_username):
     r = session.get(API_URL, params={
         "action": "query", "meta": "userinfo", "format": "json"
     })
-    data = r.json()
-    userinfo = data.get('query', {}).get('userinfo', {})
-    if not userinfo or userinfo.get("id", 0) == 0:
-        return False
+    userinfo = r.json().get('query', {}).get('userinfo', {})
     return userinfo.get("name", "").lower() == expected_username.lower()
 
 
 def login():
     username = os.getenv("WIKI_USERNAME")
     password = os.getenv("WIKI_PASSWORD")
+
     if not username or not password:
-        raise Exception("Missing WIKI_USERNAME or WIKI_PASSWORD")
+        raise Exception("Missing credentials")
 
     token = get_login_token()
+
     r = session.post(API_URL, data={
         "action": "login",
         "lgname": username,
@@ -52,15 +53,16 @@ def login():
         "format": "json"
     })
 
-    result = r.json()
-    if result.get("login", {}).get("result") != "Success":
-        raise Exception(f"Login failed: {result}")
+    if r.json().get("login", {}).get("result") != "Success":
+        raise Exception("Login failed")
 
     if not verify_login(username):
         raise Exception("Login verification failed")
 
     logging.info(f"Logged in as {username}")
 
+
+# ---------------- PAGE FETCH ----------------
 
 def get_csrf_token():
     r = session.get(API_URL, params={
@@ -74,21 +76,27 @@ def get_page(title):
         "action": "query",
         "prop": "revisions",
         "rvprop": "content|ids",
+        "rvslots": "main",
         "titles": title,
         "format": "json",
         "maxlag": 5
     })
 
-    pages = r.json()["query"]["pages"]
-    page = next(iter(pages.values()))
+    data = r.json()
+    pages = data.get("query", {}).get("pages", {})
+    page = next(iter(pages.values()), None)
 
-    if "missing" in page:
+    if not page or "missing" in page:
         return None, None
 
-    rev = page["revisions"][0]
+    revisions = page.get("revisions")
+    if not revisions:
+        return None, None
 
-    if "slots" in rev and "main" in rev["slots"]:
-        text = rev["slots"]["main"]["*"]
+    rev = revisions[0]
+
+    if "slots" in rev:
+        text = rev["slots"]["main"].get("content", "")
     else:
         text = rev.get("*", "")
 
@@ -97,6 +105,7 @@ def get_page(title):
 
 def edit_page(title, text, summary):
     token = get_csrf_token()
+
     r = session.post(API_URL, data={
         "action": "edit",
         "title": title,
@@ -114,6 +123,8 @@ def edit_page(title, text, summary):
     return result["edit"]["newrevid"]
 
 
+# ---------------- REF PROCESSING ----------------
+
 def normalize_ref(content):
     return re.sub(r"\s+", " ", content.strip())
 
@@ -128,36 +139,17 @@ def is_inside_template(node):
 
 
 def generate_ref_name(content, fallback_count):
-    # Try website/work/publisher
     m = re.search(r"\|\s*(website|work|publisher)\s*=\s*([^|}]+)", content, re.I)
     if m:
-        name = m.group(2).strip().lower()
-        name = re.sub(r"[^a-z0-9]+", "-", name)
+        name = re.sub(r"[^a-z0-9]+", "-", m.group(2).lower())
         return name.strip("-")
 
-    # Try title
     m = re.search(r"\|\s*title\s*=\s*([^|}]+)", content, re.I)
     if m:
-        name = m.group(1).strip().lower()
-        name = re.sub(r"[^a-z0-9]+", "-", name)
+        name = re.sub(r"[^a-z0-9]+", "-", m.group(1).lower())
         return name.strip("-")[:30]
 
     return f"auto{fallback_count}"
-
-
-def parse_worklist(text):
-    items = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("*"):
-            continue
-        content = line[1:].strip()
-        m = re.match(r"\[\[(.*?)\]\]", content)
-        if m:
-            items.append({"title": m.group(1)})
-        else:
-            items.append({"wikitext": content, "label": content})
-    return items[:MAX_PAGES]
 
 
 def fix_duplicate_refs(text):
@@ -175,7 +167,7 @@ def fix_duplicate_refs(text):
         content = str(ref.contents).strip() if ref.contents else ""
         norm = normalize_ref(content)
 
-        # If already named, learn from it
+        # Learn from already named refs
         if ref.has("name"):
             name = str(ref.get("name").value).strip()
             if content:
@@ -192,12 +184,12 @@ def fix_duplicate_refs(text):
             ref.self_closing = True
             changes.append((content, f'<ref name="{name}"/>'))
         else:
-            base_name = generate_ref_name(content, count)
-            name = base_name
+            base = generate_ref_name(content, count)
+            name = base
             i = 2
 
             while name in seen.values():
-                name = f"{base_name}-{i}"
+                name = f"{base}-{i}"
                 i += 1
 
             seen[norm] = name
@@ -208,35 +200,40 @@ def fix_duplicate_refs(text):
     return str(wikicode), changes
 
 
+# ---------------- WORKLIST ----------------
+
+def parse_worklist(text):
+    items = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("*"):
+            continue
+
+        content = line[1:].strip()
+        m = re.match(r"\[\[(.*?)\]\]", content)
+
+        if m:
+            items.append({"title": m.group(1)})
+        else:
+            items.append({"wikitext": content, "label": content})
+
+    return items[:MAX_PAGES]
+
+
+# ---------------- PROCESS ----------------
+
 def build_diff_link(new_rev):
     return f"https://test.wikipedia.org/?diff={new_rev}"
 
 
-def update_list_page(original_text, results):
-    text = original_text
-
-    for item in results:
-        article, summary = item["label"], item["summary"]
-        pattern = re.escape(f"* {article}")
-        replacement = f"<s>* {article}</s> – {summary}"
-        text = re.sub(pattern, replacement, text, count=1)
-
-    if DRY_RUN:
-        print("\n--- LIST UPDATE ---\n")
-        print(text[:1000])
-        return
-
-    edit_page(LIST_PAGE, text, "Updating processed articles (bot)")
-
-
 def process_item(item):
     if "title" in item:
-        text, old_rev = get_page(item["title"])
+        text, _ = get_page(item["title"])
         label = item["title"]
     else:
         text = item["wikitext"]
-        old_rev = None
-        label = item.get("label", "Unnamed block")
+        label = item.get("label", "Unnamed")
 
     if not text or len(text) > MAX_SIZE:
         return None
@@ -247,27 +244,45 @@ def process_item(item):
         return None
 
     if DRY_RUN:
-        print(f"[DRY RUN] Would edit {label}")
-        return {"label": label, "new_text": new_text, "changes": changes}
+        print(f"[DRY RUN] {label}")
+        return {"label": label}
 
     if "title" in item:
         new_rev = edit_page(
             item["title"],
             new_text,
-            "Bot: Convert duplicate <ref> tags to named references"
+            "Bot: Fix duplicate references"
         )
-        short_link = build_diff_link(new_rev)
+        link = build_diff_link(new_rev)
     else:
-        short_link = "RAW_WIKITEXT"
+        link = "RAW"
 
     original, fixed = changes[0]
-    summary_text = f"Replaced <ref>{original}</ref> with {fixed}; {short_link}"
+    summary = f"Replaced <ref>{original}</ref> with {fixed}; {link}"
 
-    return {"label": label, "summary": summary_text}
+    return {"label": label, "summary": summary}
 
+
+def update_list_page(original_text, results):
+    text = original_text
+
+    for item in results:
+        pattern = re.escape(f"* {item['label']}")
+        replacement = f"<s>* {item['label']}</s> – {item['summary']}"
+        text = re.sub(pattern, replacement, text, count=1)
+
+    if DRY_RUN:
+        print(text[:1000])
+        return
+
+    edit_page(LIST_PAGE, text, "Updating processed articles (bot)")
+
+
+# ---------------- MAIN ----------------
 
 def main():
     login()
+
     worklist_text, _ = get_page(LIST_PAGE)
     items = parse_worklist(worklist_text)
 
