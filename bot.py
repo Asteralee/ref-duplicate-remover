@@ -207,16 +207,23 @@ def parse_worklist(text):
 
     for line in text.splitlines():
         line = line.strip()
+
         if not line.startswith("*"):
             continue
 
-        content = line[1:].strip()
-        m = re.match(r"\[\[(.*?)\]\]", content)
+        content = line.lstrip("*").strip()
 
+        m = re.match(r"\[\[\s*([^|\]]+)(?:\|[^\]]*)?\s*\]\]", content)
         if m:
-            items.append({"title": m.group(1)})
-        else:
-            items.append({"wikitext": content, "label": content})
+            title = m.group(1).strip()
+            items.append({"title": title, "label": content})
+            continue
+
+        if content and not any(x in content for x in ["{", "<", "[[File:", "[[Image:"]):
+            items.append({"title": content, "label": content})
+            continue
+
+        items.append({"wikitext": content, "label": content})
 
     return items[:MAX_PAGES]
 
