@@ -278,7 +278,7 @@ def update_list_page(original_text, results):
     text = original_text
     for item in results:
         pattern = re.escape(f"* [[{item['label']}]]")
-        replacement = f"<s>* [[{item['label']}]]</s> – done"
+        replacement = f"* <s>[[{item['label']}]]</s> – done"
         text = re.sub(pattern, replacement, text, count=1)
     if DRY_RUN:
         return
@@ -293,7 +293,6 @@ def main():
     if not worklist_text:
         logging.error("Worklist page empty!")
         return
-    logging.info(f"Worklist preview:\n{worklist_text[:300]}")
     items = parse_worklist(worklist_text)
     results = []
     for item in items:
