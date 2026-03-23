@@ -2,21 +2,19 @@ import os
 import re
 import time
 import requests
-import logging
 import mwparserfromhell
 from difflib import SequenceMatcher
+import datetime
 
 # ---------------- CONFIG ----------------
 API_URL = "https://test.wikipedia.org/w/api.php"
 LIST_PAGE = "User:AsteraBot/pages to fix"
-MAX_PAGES = 10
+MAX_PAGES = 5
 MAX_SIZE = 200_000
-DRY_RUN = False  
+DRY_RUN = True  # Set to False to save edits
 
 session = requests.Session()
-session.headers.update({"User-Agent": "RefDuplicateRemover/5.0"})
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+session.headers.update({"User-Agent": "RefDuplicateRemover/7.0"})
 
 # ---------------- HELPERS ----------------
 def similarity(a, b):
@@ -28,12 +26,12 @@ def normalize_ref(content):
     content = re.sub(r"\s+\|", "|", content)
     return content.lower()
 
-def extract_field(content, field):
-    m = re.search(rf"\|\s*{field}\s*=\s*([^|}}]+)", content, re.I)
-    return m.group(1).strip() if m else None
-
-def extract_url(content):
-    return extract_field(content, "url")
+def normalize_field(val):
+    if not val:
+        return None
+    val = val.lower().strip()
+    val = re.sub(r"\s+", " ", val)
+    return val
 
 def normalize_url(url):
     if not url:
@@ -46,15 +44,11 @@ def normalize_url(url):
 
 # ---------------- LOGIN ----------------
 def get_login_token():
-    r = session.get(API_URL, params={
-        "action": "query", "meta": "tokens", "type": "login", "format": "json"
-    })
+    r = session.get(API_URL, params={"action": "query", "meta": "tokens", "type": "login", "format": "json"})
     return r.json()["query"]["tokens"]["logintoken"]
 
 def verify_login(expected_username):
-    r = session.get(API_URL, params={
-        "action": "query", "meta": "userinfo", "format": "json"
-    })
+    r = session.get(API_URL, params={"action": "query", "meta": "userinfo", "format": "json"})
     userinfo = r.json().get('query', {}).get('userinfo', {})
     return userinfo.get("name", "").lower() == expected_username.lower()
 
@@ -65,18 +59,12 @@ def login():
         raise Exception("Missing credentials")
 
     token = get_login_token()
-    r = session.post(API_URL, data={
-        "action": "login",
-        "lgname": username,
-        "lgpassword": password,
-        "lgtoken": token,
-        "format": "json"
-    })
+    r = session.post(API_URL, data={"action": "login","lgname": username,"lgpassword": password,"lgtoken": token,"format": "json"})
     if r.json().get("login", {}).get("result") != "Success":
         raise Exception("Login failed")
     if not verify_login(username):
         raise Exception("Login verification failed")
-    logging.info(f"Logged in as {username}")
+    print(f"Logged in as {username}")
 
 # ---------------- PAGE FETCH & EDIT ----------------
 def get_csrf_token():
@@ -84,44 +72,27 @@ def get_csrf_token():
     return r.json()["query"]["tokens"]["csrftoken"]
 
 def get_page(title):
-    r = session.get(API_URL, params={
-        "action": "query",
-        "prop": "revisions",
-        "rvprop": "ids|content",
-        "rvslots": "main",
-        "titles": title,
-        "format": "json",
-        "maxlag": 5
-    })
+    r = session.get(API_URL, params={"action": "query","prop": "revisions","rvprop": "ids|content","rvslots": "main","titles": title,"format": "json","maxlag": 5})
     data = r.json()
     pages = data.get("query", {}).get("pages", {})
     page = next(iter(pages.values()), None)
     if not page or "missing" in page:
-        logging.warning(f"Page missing: {title}")
+        print(f"Page missing: {title}")
         return None, None
     rev = page.get("revisions", [{}])[0]
     text = rev.get("slots", {}).get("main", {}).get("*") if "slots" in rev else rev.get("*", "")
     if not text:
-        logging.warning(f"No content retrieved for {title}")
+        print(f"No content retrieved for {title}")
     return text, rev.get("revid")
 
 def edit_page(title, text, summary, base_revid):
     token = get_csrf_token()
     for attempt in range(3):
-        r = session.post(API_URL, data={
-            "action": "edit",
-            "title": title,
-            "text": text,
-            "summary": summary,
-            "token": token,
-            "format": "json",
-            "baserevid": base_revid,
-            "maxlag": 5
-        })
+        r = session.post(API_URL, data={"action": "edit","title": title,"text": text,"summary": summary,"token": token,"format": "json","baserevid": base_revid,"maxlag": 5})
         result = r.json()
         if "error" in result:
             if result["error"].get("code") == "maxlag":
-                logging.warning("Maxlag hit, retrying...")
+                print("Maxlag hit, retrying...")
                 time.sleep(5)
                 continue
             raise Exception(result["error"])
@@ -143,13 +114,6 @@ def get_canonical_url(cite_data):
     archive = normalize_url(cite_data.get("archive-url")) if cite_data else None
     original = normalize_url(cite_data.get("url")) if cite_data else None
     return archive or original
-
-def normalize_field(val):
-    if not val:
-        return None
-    val = val.lower().strip()
-    val = re.sub(r"\s+", " ", val)
-    return val
 
 def cite_templates_match(a, b):
     if not a or not b:
@@ -189,14 +153,13 @@ def generate_human_name(data, fallback_count):
         return re.sub(r"[^a-z0-9\-]", "", name)[:40]
     return f"ref{fallback_count}"
 
+# ---------------- FIX DUPLICATE REFS (only names duplicates) ----------------
 def fix_duplicate_refs(text):
-    logging.info("Running advanced duplicate ref fixer")
     wikicode = mwparserfromhell.parse(text)
     refs = [tag for tag in wikicode.filter_tags() if str(tag.tag).lower() == "ref"]
-    seen = []  # list of dicts: {name, content, parsed}
-    name_used = set()
-    fallback_count = 1
-    changes = []
+
+    key_map = {}
+    parsed_map = {}
     for ref in refs:
         if not ref.contents:
             continue
@@ -204,34 +167,43 @@ def fix_duplicate_refs(text):
         if re.search(r"\{\{\s*(harv|sfn|sfnp)", content, re.I):
             continue
         parsed = parse_cite_template(content)
-        norm_content = normalize_ref(content)
-        existing_name = str(ref.get("name").value).strip() if ref.has("name") else None
-        match = None
-        for item in seen:
-            if norm_content == item["content"]:
-                match = item
-                break
-            if parsed and item["parsed"] and cite_templates_match(parsed, item["parsed"]):
-                match = item
-                break
-        if not match:
-            name = existing_name or generate_human_name(parsed, fallback_count)
+        url = get_canonical_url(parsed)
+        key = url if url else normalize_ref(content)
+        if key not in key_map:
+            key_map[key] = []
+            parsed_map[key] = parsed
+        key_map[key].append(ref)
+
+    name_used = set()
+    fallback_count = 1
+    changes = []
+
+    for key, ref_list in key_map.items():
+        if len(ref_list) < 2:
+            continue
+
+        first_ref = ref_list[0]
+        parsed = parsed_map[key]
+
+        if first_ref.has("name"):
+            name = str(first_ref.get("name").value).strip()
+        else:
+            name = generate_human_name(parsed, fallback_count)
             base = name
             i = 2
             while name in name_used:
                 name = f"{base}-{i}"
                 i += 1
-            seen.append({"name": name, "content": norm_content, "parsed": parsed})
-            name_used.add(name)
-            if not ref.has("name"):
-                ref.add("name", name)
+            first_ref.add("name", name)
             fallback_count += 1
-        else:
-            name = match["name"]
+
+        name_used.add(name)
+
+        for dup_ref in ref_list[1:]:
             new_node = mwparserfromhell.parse(f'<ref name="{name}"/>').nodes[0]
-            wikicode.replace(ref, new_node)
+            wikicode.replace(dup_ref, new_node)
             changes.append(name)
-    logging.info(f"Duplicate refs fixed: {len(changes)}")
+
     return str(wikicode), changes
 
 # ---------------- WORKLIST ----------------
@@ -245,43 +217,45 @@ def parse_worklist(text):
         m = re.match(r"\[\[\s*([^|\]]+)", content)
         if m:
             items.append({"title": m.group(1).strip(), "label": content})
-    logging.info(f"Parsed {len(items)} worklist items")
     return items[:MAX_PAGES]
 
 # ---------------- PROCESS ----------------
 def process_item(item):
     label = item["title"]
-    logging.info(f"Processing: {label}")
+    print(f"Processing: {label}")
     text, revid = get_page(label)
     if not text or len(text) > MAX_SIZE:
-        logging.warning(f"Skipping {label}: no content or too large")
+        print(f"Skipping {label}: no content or too large")
         return None
     new_text, changes = fix_duplicate_refs(text)
     if not changes:
-        logging.info(f"No duplicate refs in {label}")
+        print(f"No duplicate refs in {label}")
         return None
     if DRY_RUN:
-        logging.info(f"[DRY RUN] Would edit {label}")
+        print(f"[DRY RUN] Would edit {label}")
         return {"label": label}
-    new_rev = edit_page(label, new_text, "Bot: Fix duplicate references", revid)
-    return {"label": label, "rev": new_rev}
+    edit_page(label, new_text, "Bot: Fix duplicate references", revid)
+    print("Edit was successful")
+    return {"label": label, "rev": revid}
 
 def update_list_page(original_text, results):
     text = original_text
+    today = datetime.date.today().strftime("%d %B %Y")
     for item in results:
         pattern = re.escape(f"* [[{item['label']}]]")
-        replacement = f"* <s>[[{item['label']}]]</s> – done"
+        replacement = f"* [[{item['label']}]] {{done}} on {today}"
         text = re.sub(pattern, replacement, text, count=1)
     if DRY_RUN:
         return
     edit_page(LIST_PAGE, text, "Updating processed articles (bot)", None)
+    print("Worklist edited successfully")
 
 # ---------------- MAIN ----------------
 def main():
     login()
     worklist_text, _ = get_page(LIST_PAGE)
     if not worklist_text:
-        logging.error("Worklist page empty!")
+        print("Worklist page empty!")
         return
     items = parse_worklist(worklist_text)
     results = []
@@ -292,8 +266,7 @@ def main():
                 results.append(result)
             time.sleep(3)
         except Exception as e:
-            logging.error(f"Error on {item}: {e}")
-    logging.info(f"Total edits: {len(results)}")
+            print(f"Error on {item}: {e}")
     if results:
         update_list_page(worklist_text, results)
 
