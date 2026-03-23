@@ -6,7 +6,6 @@ import mwparserfromhell
 from difflib import SequenceMatcher
 import datetime
 
-# ---------------- CONFIG ----------------
 API_URL = "https://test.wikipedia.org/w/api.php"
 LIST_PAGE = "User:AsteraBot/pages to fix"
 MAX_PAGES = 5
@@ -16,7 +15,6 @@ DRY_RUN = False
 session = requests.Session()
 session.headers.update({"User-Agent": "RefDuplicateRemover/7.0"})
 
-# ---------------- HELPERS ----------------
 def similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
@@ -42,7 +40,6 @@ def normalize_url(url):
     url = re.sub(r"\?.*$", "", url)
     return url.rstrip("/")
 
-# ---------------- LOGIN ----------------
 def get_login_token():
     r = session.get(API_URL, params={"action": "query", "meta": "tokens", "type": "login", "format": "json"})
     return r.json()["query"]["tokens"]["logintoken"]
@@ -66,7 +63,6 @@ def login():
         raise Exception("Login verification failed")
     print(f"Logged in as {username}")
 
-# ---------------- PAGE FETCH & EDIT ----------------
 def get_csrf_token():
     r = session.get(API_URL, params={"action": "query", "meta": "tokens", "format": "json"})
     return r.json()["query"]["tokens"]["csrftoken"]
@@ -99,7 +95,6 @@ def edit_page(title, text, summary, base_revid):
         return result["edit"]["newrevid"]
     raise Exception("Edit failed after retries")
 
-# ---------------- CITATION LOGIC ----------------
 def parse_cite_template(content):
     wikicode = mwparserfromhell.parse(content)
     templates = wikicode.filter_templates()
@@ -153,7 +148,6 @@ def generate_human_name(data, fallback_count):
         return re.sub(r"[^a-z0-9\-]", "", name)[:40]
     return f"ref{fallback_count}"
 
-# ---------------- FIX DUPLICATE REFS (only names duplicates) ----------------
 def fix_duplicate_refs(text):
     wikicode = mwparserfromhell.parse(text)
     refs = [tag for tag in wikicode.filter_tags() if str(tag.tag).lower() == "ref"]
@@ -206,7 +200,6 @@ def fix_duplicate_refs(text):
 
     return str(wikicode), changes
 
-# ---------------- WORKLIST ----------------
 def parse_worklist(text):
     items = []
     for line in text.splitlines():
@@ -219,7 +212,6 @@ def parse_worklist(text):
             items.append({"title": m.group(1).strip(), "label": content})
     return items[:MAX_PAGES]
 
-# ---------------- PROCESS ----------------
 def process_item(item):
     label = item["title"]
     print(f"Processing: {label}")
@@ -243,14 +235,13 @@ def update_list_page(original_text, results):
     today = datetime.date.today().strftime("%d %B %Y")
     for item in results:
         pattern = re.escape(f"* [[{item['label']}]]")
-        replacement = f"* [[{item['label']}]] {{done}} on {today}"
+        replacement = f"* [[{item['label']}]] {{{{done}}}} on {today}"
         text = re.sub(pattern, replacement, text, count=1)
     if DRY_RUN:
         return
     edit_page(LIST_PAGE, text, "Updating processed articles (bot)", None)
     print("Worklist edited successfully")
 
-# ---------------- MAIN ----------------
 def main():
     login()
     worklist_text, _ = get_page(LIST_PAGE)
