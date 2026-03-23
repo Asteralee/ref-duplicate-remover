@@ -6,7 +6,7 @@ import logging
 import mwparserfromhell
 
 API_URL = "https://test.wikipedia.org/w/api.php"
-LIST_PAGE = "User:AsteraBot/Pages to fix"
+LIST_PAGE = "User:AsteraBot/pages to fix"
 MAX_PAGES = 10
 MAX_SIZE = 200_000
 DRY_RUN = False
